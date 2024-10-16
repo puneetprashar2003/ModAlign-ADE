@@ -3,9 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
-from transformers import BertTokenizer, BertModel
-from torchvision.models import vgg16
-from torchvision import transforms
+from transformers import ViTFeatureExtractor, RobertaTokenizer, ViTModel, RobertaModel
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, f1_score, confusion_matrix, recall_score, precision_score
 from sklearn.utils.class_weight import compute_class_weight
