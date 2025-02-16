@@ -1,583 +1,722 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
-from transformers import ViTFeatureExtractor, RobertaTokenizer, ViTModel, RobertaModel
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, f1_score, confusion_matrix, recall_score, precision_score
-from sklearn.utils.class_weight import compute_class_weight
+from torch.utils.data import Dataset, DataLoader, random_split
+from transformers import ViTModel, ViTConfig, ViTFeatureExtractor
+from transformers import RobertaModel, RobertaTokenizer, RobertaConfig
+from PIL import Image
 import pandas as pd
 import numpy as np
-from PIL import Image
 import os
+import logging
 from tqdm import tqdm
-import matplotlib.pyplot as plt
-import seaborn as sns
-import random
+from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_score
+import math
+import json
+from torchvision import transforms
+from datetime import datetime
 
-class CrossAttention(nn.Module):
-    def __init__(self, dim):
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class Config:
+    def __init__(self):
+        self.hidden_dim = 256
+        self.num_heads = 4
+        self.ff_dim = 1024
+        self.num_encoder_layers = 2
+        self.num_decoder_layers = 2
+        self.dropout = 0.1
+        self.num_classes = 1
+        self.batch_size = 32
+        self.num_epochs = 100
+        self.learning_rate = 2e-5
+        self.weight_decay = 0.01
+        self.mask_prob = 0.3
+        self.beta = 0.1
+        self.num_diffusion_steps = 100
+        self.beta_start = 0.0001
+        self.beta_end = 0.02
+        self.lambda_v2t = 0.1
+        self.lambda_t2t = 0.1
+        self.data_path = "data/blip2_fine_tuned.csv"
+        self.image_dir = 'data/combined_adr_images'
+        self.checkpoint_dir = "checkpoints"
+        self.log_dir = "logs"
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.num_workers = 4
+        
+    def _validate_config(self):
+        assert self.hidden_dim % self.num_heads == 0, "hidden_dim must be divisible by num_heads"
+        assert 0 <= self.mask_prob <= 1, "mask_prob must be between 0 and 1"
+        assert self.num_encoder_layers > 0, "num_encoder_layers must be positive"
+        assert self.num_decoder_layers > 0, "num_decoder_layers must be positive"
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, config):
         super().__init__()
-        self.query = nn.Linear(dim, dim)
-        self.key = nn.Linear(dim, dim)
-        self.value = nn.Linear(dim, dim)
-        self.scale = dim ** -0.5
+        self.dim = config.hidden_dim
+        self.num_heads = config.num_heads
+        self.head_dim = self.dim // self.num_heads
+        self.scale = self.head_dim ** -0.5
+        
+        self.q_proj = nn.Linear(self.dim, self.dim)
+        self.k_proj = nn.Linear(self.dim, self.dim)
+        self.v_proj = nn.Linear(self.dim, self.dim)
+        self.out_proj = nn.Linear(self.dim, self.dim)
+        self.dropout = nn.Dropout(config.dropout)
+        self.reset_parameters()
 
-    def forward(self, x, context):
-        q = self.query(x)
-        k = self.key(context)
-        v = self.value(context)
+    def reset_parameters(self):
+        nn.init.xavier_uniform_(self.q_proj.weight)
+        nn.init.xavier_uniform_(self.k_proj.weight)
+        nn.init.xavier_uniform_(self.v_proj.weight)
+        nn.init.xavier_uniform_(self.out_proj.weight)
 
-        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-        attn = F.softmax(attn, dim=-1)
+    def forward(self, q, k, v, mask=None):
+        batch_size = q.size(0)
+        
+        q = self.q_proj(q).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(k).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(v).view(batch_size, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        if mask is not None:
+            scores = scores.masked_fill(mask == 0, float('-inf'))
+        attn = F.softmax(scores, dim=-1)
+        attn = self.dropout(attn)
+        
         out = torch.matmul(attn, v)
+        out = out.transpose(1, 2).contiguous().view(batch_size, -1, self.dim)
+        out = self.out_proj(out)
         return out
 
-class CrossViTBlock(nn.Module):
-    def __init__(self, dim):
+class PositionWiseFeedForward(nn.Module):
+    def __init__(self, config):
         super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
-        self.attn = CrossAttention(dim)
-        self.norm2 = nn.LayerNorm(dim)
-        self.ffn = nn.Sequential(
-            nn.Linear(dim, dim * 4),
-            nn.GELU(),
-            nn.Linear(dim * 4, dim)
-        )
+        self.fc1 = nn.Linear(config.hidden_dim, config.ff_dim)
+        self.fc2 = nn.Linear(config.ff_dim, config.hidden_dim)
+        self.dropout = nn.Dropout(config.dropout)
+        self.norm = nn.LayerNorm(config.hidden_dim)
 
-    def forward(self, x, context):
-        x = x + self.attn(self.norm1(x), self.norm1(context))
-        x = x + self.ffn(self.norm2(x))
+    def forward(self, x):
+        residual = x
+        x = self.norm(x)
+        x = F.relu(self.fc1(x))
+        x = self.dropout(x)
+        x = self.fc2(x)
+        return x + residual
+
+class TransformerEncoderLayer(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.self_attn = MultiHeadAttention(config)
+        self.feed_forward = PositionWiseFeedForward(config)
+        self.norm1 = nn.LayerNorm(config.hidden_dim)
+        self.norm2 = nn.LayerNorm(config.hidden_dim)
+        self.dropout = nn.Dropout(config.dropout)
+
+    def forward(self, x, mask=None):
+        residual = x
+        x = self.norm1(x)
+        x = self.self_attn(x, x, x, mask)
+        x = residual + self.dropout(x)
+        x = x + self.feed_forward(x)
         return x
 
-class CrossViT(nn.Module):
-    def __init__(self, img_dim, text_dim, hidden_dim, num_layers):
+class TransformerDecoderLayer(nn.Module):
+    def __init__(self, config):
         super().__init__()
-        self.img_proj = nn.Linear(img_dim, hidden_dim)
-        self.text_proj = nn.Linear(text_dim, hidden_dim)
+        self.self_attn = MultiHeadAttention(config)
+        self.cross_attn = MultiHeadAttention(config)
+        self.feed_forward = PositionWiseFeedForward(config)
+        self.norm1 = nn.LayerNorm(config.hidden_dim)
+        self.norm2 = nn.LayerNorm(config.hidden_dim)
+        self.norm3 = nn.LayerNorm(config.hidden_dim)
+        self.dropout = nn.Dropout(config.dropout)
+
+    def forward(self, x, memory, self_mask=None, cross_mask=None):
+        residual = x
+        x = self.norm1(x)
+        x = self.self_attn(x, x, x, self_mask)
+        x = residual + self.dropout(x)
         
-        self.img_blocks = nn.ModuleList([CrossViTBlock(hidden_dim) for _ in range(num_layers)])
-        self.text_blocks = nn.ModuleList([CrossViTBlock(hidden_dim) for _ in range(num_layers)])
-
-    def forward(self, img_features, text_features):
-        img = self.img_proj(img_features)
-        text = self.text_proj(text_features)
-
-        for img_block, text_block in zip(self.img_blocks, self.text_blocks):
-            img = img_block(img, text)
-            text = text_block(text, img)
-
-        return img, text
-class ADEClassifier(nn.Module):
-    def __init__(self, num_classes):
-        super().__init__()
-        self.vit = ViTModel.from_pretrained('google/vit-base-patch16-224')
-        self.roberta = RobertaModel.from_pretrained('roberta-base')
+        residual = x
+        x = self.norm2(x)
+        x = self.cross_attn(x, memory, memory, cross_mask)
+        x = residual + self.dropout(x)
         
-        self.cross_vit = CrossViT(768, 768, 512, num_layers=3)
-        
-        self.shared_classifier = nn.Sequential(
-            nn.Linear(512 * 2, 512),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(512, num_classes)
-        )
-        
-        self.img_specific_classifier = nn.Linear(768, num_classes)
-        self.text_specific_classifier = nn.Linear(768, num_classes)
-        
-        self.missing_modality_generator = nn.Linear(512, 512)
-
-    def forward(self, image, input_ids, attention_mask, fine_tuned_input_ids, fine_tuned_attention_mask, image_mask, text_mask):
-        batch_size = image.size(0)
-        
-        # Process image
-        img_features = self.vit(pixel_values=image).last_hidden_state
-        img_features = img_features * image_mask.unsqueeze(1).unsqueeze(2)
-        
-        # Process original text
-        text_features = self.roberta(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
-        text_features = text_features * text_mask.unsqueeze(1).unsqueeze(2)
-        
-        # Process fine-tuned text
-        fine_tuned_features = self.roberta(input_ids=fine_tuned_input_ids, attention_mask=fine_tuned_attention_mask).last_hidden_state
-        
-        # Use fine-tuned text when image is available
-        text_features = torch.where(image_mask.unsqueeze(1).unsqueeze(2),
-                                    fine_tuned_features,
-                                    text_features)
-
-        fused_img, fused_text = self.cross_vit(img_features, text_features)
-        
-        img_cls = fused_img[:, 0]
-        text_cls = fused_text[:, 0]
-        
-        # Generate missing modality features
-        missing_img_features = self.missing_modality_generator(text_cls) * (~image_mask).unsqueeze(1)
-        missing_text_features = self.missing_modality_generator(img_cls) * (~text_mask).unsqueeze(1)
-        
-        # Combine with original features
-        img_cls = img_cls + missing_img_features
-        text_cls = text_cls + missing_text_features
-        
-        combined = torch.cat((img_cls, text_cls), dim=1)
-        shared_output = self.shared_classifier(combined)
-        
-        img_specific_output = self.img_specific_classifier(img_features[:, 0])
-        text_specific_output = self.text_specific_classifier(text_features[:, 0])
-        
-        return shared_output, img_specific_output, text_specific_output, img_cls, text_cls
-
-class ADEDataset(Dataset):
-    def __init__(self, csv_file, img_dir, mask_prob=0.3):
-        self.data = pd.read_csv(csv_file)
-        self.img_dir = img_dir
-        self.image_processor = ViTFeatureExtractor.from_pretrained('google/vit-base-patch16-224')
-        self.tokenizer = RobertaTokenizer.from_pretrained('roberta-base')
-        self.mask_prob = mask_prob
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        img_name = os.path.join(self.img_dir, self.data.iloc[idx, 0])
-        image = Image.open(img_name).convert('RGB')
-        
-        text = self.data.iloc[idx, 1]
-        blip_fine_tuned_final = self.data.iloc[idx, -1]
-        label = 1 if self.data.iloc[idx, 2] == 'ADR' else 0
-
-        # Process image
-        image = self.image_processor(images=image, return_tensors="pt")['pixel_values'].squeeze()
-
-        # Process text
-        encoding = self.tokenizer.encode_plus(
-            text,
-            add_special_tokens=True,
-            max_length=128,
-            padding='max_length',
-            truncation=True,
-            return_attention_mask=True,
-            return_tensors='pt'
-        )
-        input_ids = encoding['input_ids'].squeeze()
-        attention_mask = encoding['attention_mask'].squeeze()
-
-        # Process blip fine-tuned final text
-        blip_fine_tuned_encoding = self.tokenizer.encode_plus(
-            blip_fine_tuned_final,
-            add_special_tokens=True,
-            max_length=128,
-            padding='max_length',
-            truncation=True,
-            return_attention_mask=True,
-            return_tensors='pt'
-        )
-        blip_fine_tuned_input_ids = blip_fine_tuned_encoding['input_ids'].squeeze()
-        blip_fine_tuned_attention_mask = blip_fine_tuned_encoding['attention_mask'].squeeze()
-
-        # Randomly mask one modality
-        mask_image = random.random() < self.mask_prob
-        mask_text = random.random() < self.mask_prob
-        
-        if mask_image and mask_text:
-            mask_text = False  # Ensure at least one modality is always present
-
-        return {
-            'image': image if not mask_image else torch.zeros_like(image),
-            'input_ids': input_ids,
-            'attention_mask': attention_mask,
-            'fine_tuned_input_ids': blip_fine_tuned_input_ids,
-            'fine_tuned_attention_mask': blip_fine_tuned_attention_mask,
-            'image_mask': torch.tensor(not mask_image, dtype=torch.bool),
-            'text_mask': torch.tensor(not mask_text, dtype=torch.bool),
-            'label': torch.tensor(label, dtype=torch.long)
-        }
-
-class CrossAttention(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.query = nn.Linear(dim, dim)
-        self.key = nn.Linear(dim, dim)
-        self.value = nn.Linear(dim, dim)
-        self.scale = dim ** -0.5
-
-    def forward(self, x, context):
-        q = self.query(x)
-        k = self.key(context)
-        v = self.value(context)
-
-        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-        attn = F.softmax(attn, dim=-1)
-        out = torch.matmul(attn, v)
-        return out
-
-class CrossViTBlock(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
-        self.attn = CrossAttention(dim)
-        self.norm2 = nn.LayerNorm(dim)
-        self.ffn = nn.Sequential(
-            nn.Linear(dim, dim * 4),
-            nn.GELU(),
-            nn.Linear(dim * 4, dim)
-        )
-
-    def forward(self, x, context):
-        x = x + self.attn(self.norm1(x), self.norm1(context))
-        x = x + self.ffn(self.norm2(x))
+        x = x + self.feed_forward(x)
         return x
 
-class CrossViT(nn.Module):
-    def __init__(self, img_dim, text_dim, hidden_dim, num_layers):
+class ScoreNetwork(nn.Module):
+    def __init__(self, config):
         super().__init__()
-        self.img_proj = nn.Linear(img_dim, hidden_dim)
-        self.text_proj = nn.Linear(text_dim, hidden_dim)
+        self.input_dim = config.hidden_dim * 2
+        self.hidden_dim = config.hidden_dim
         
-        self.img_blocks = nn.ModuleList([CrossViTBlock(hidden_dim) for _ in range(num_layers)])
-        self.text_blocks = nn.ModuleList([CrossViTBlock(hidden_dim) for _ in range(num_layers)])
+        self.layers = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(self.input_dim + 1, self.hidden_dim),
+                nn.LayerNorm(self.hidden_dim),
+                nn.ReLU(),
+                nn.Linear(self.hidden_dim, self.hidden_dim)
+            ) for _ in range(3)
+        ])
+        
+        self.cross_attention = MultiHeadAttention(config)
+        self.output_proj = nn.Linear(self.hidden_dim, config.hidden_dim)
 
-    def forward(self, img_features, text_features):
-        img = self.img_proj(img_features)
-        text = self.text_proj(text_features)
+    def forward(self, x, t, condition):
+        t = t.unsqueeze(-1)
+        h = torch.cat([x, condition, t], dim=-1)
+        
+        for layer in self.layers:
+            h_prev = h
+            h = layer(h)
+            h = h + h_prev
+            
+            h = self.cross_attention(
+                q=h.unsqueeze(1),
+                k=condition.unsqueeze(1),
+                v=condition.unsqueeze(1)
+            ).squeeze(1)
+        
+        return self.output_proj(h)
 
-        for img_block, text_block in zip(self.img_blocks, self.text_blocks):
-            img = img_block(img, text)
-            text = text_block(text, img)
-
-        return img, text
-
-class ADEClassifier(nn.Module):
-    def __init__(self, num_classes):
+class StochasticDiffusion(nn.Module):
+    def __init__(self, config):
         super().__init__()
-        self.vit = ViTModel.from_pretrained('google/vit-base-patch16-224')
-        self.roberta = RobertaModel.from_pretrained('roberta-base')
+        self.num_steps = config.num_diffusion_steps
+        self.beta_start = config.beta_start
+        self.beta_end = config.beta_end
         
-        self.cross_vit = CrossViT(768, 768, 512, num_layers=3)
+        self.betas = torch.linspace(self.beta_start, self.beta_end, self.num_steps)
+        self.alphas = 1 - self.betas
+        self.alpha_bars = torch.cumprod(self.alphas, dim=0)
+
+    def forward_diffusion(self, x, t):
+        alpha_bar = self.alpha_bars[t]
+        noise = torch.randn_like(x)
+        noisy_x = torch.sqrt(alpha_bar)[:, None] * x + torch.sqrt(1 - alpha_bar)[:, None] * noise
+        return noisy_x, noise
+
+    def reverse_diffusion(self, x, score_fn, condition=None):
+        x_t = torch.randn_like(x)
+        for t in reversed(range(self.num_steps)):
+            time_tensor = torch.ones(x.shape[0], device=x.device) * t
+            score = score_fn(x_t, time_tensor, condition)
+            x_t = self.reverse_diffusion_step(x_t, score, t)
+        return x_t
+
+    def reverse_diffusion_step(self, x, score, t):
+        beta_t = self.betas[t]
+        alpha_t = self.alphas[t]
+        alpha_bar_t = self.alpha_bars[t]
         
-        self.shared_classifier = nn.Sequential(
-            nn.Linear(512 * 2, 512),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(512, num_classes)
+        noise = torch.randn_like(x) if t > 0 else torch.zeros_like(x)
+        mean = (1 / torch.sqrt(alpha_t)) * (x - (beta_t / (torch.sqrt(1 - alpha_bar_t))) * score)
+        var = beta_t * noise
+        
+        return mean + var
+
+class FeatureAlignmentModule(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.v2t_decoder = TransformerDecoderLayer(config)
+        self.t2t_decoder = TransformerDecoderLayer(config)
+        self.config = config
+
+    def forward(self, text_features, visual_features, blip_features):
+        v2t_aligned = self.v2t_decoder(text_features, visual_features)
+        t2t_aligned = self.t2t_decoder(text_features, blip_features)
+        return v2t_aligned, t2t_aligned
+
+    def compute_loss(self, v2t_aligned, t2t_aligned, text_features):
+        v2t_loss = F.mse_loss(v2t_aligned, text_features)
+        t2t_loss = F.mse_loss(t2t_aligned, text_features)
+        return self.config.lambda_v2t * v2t_loss, self.config.lambda_t2t * t2t_loss
+
+class FeatureRecoveryModule(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.beta_min = config.beta_start
+        self.beta_max = config.beta_end
+        self.num_steps = config.num_diffusion_steps
+        self.hidden_dim = config.hidden_dim
+        self.score_network = ScoreNetwork(config)
+
+    def time_weight(self, t):
+        """Calculate time-dependent weighting factor pλ(t)"""
+        
+        beta_t = self.beta_min + t * (self.beta_max - self.beta_min)
+        return 1.0 / beta_t
+
+    def drift_coefficient(self, x, t):
+        beta_t = self.beta_min + t * (self.beta_max - self.beta_min)
+        return -0.5 * beta_t * x
+
+    def diffusion_coefficient(self, t):
+        beta_t = self.beta_min + t * (self.beta_max - self.beta_min)
+        return torch.sqrt(beta_t)
+
+    def score_matching_loss(self, x_k, x_obs, t, noise_scale=1.0):
+        """
+        Compute conditional score matching loss:
+        Lscore = Eξ[|pλ(t)sk(xk(t), xIobs(t), t; θk) + z|²]
+        
+        Args:
+            x_k: Features being recovered
+            x_obs: Observed/conditioning features
+            t: Time step
+            noise_scale: Scale of noise distribution
+        """
+        batch_size = x_k.shape[0]
+        
+        
+        z = torch.randn_like(x_k) * noise_scale
+        
+        
+        p_lambda = self.time_weight(t)
+        
+        
+        score = self.score_network(x_k, t, x_obs)
+        
+        
+        weighted_score = p_lambda.unsqueeze(-1) * score
+        
+        
+        loss = torch.pow(weighted_score + z, 2).mean()
+        
+        return loss
+
+    def forward_sde(self, x, dt=1e-3):
+        batch_size = x.shape[0]
+        t = torch.zeros(batch_size, device=x.device)
+        x_t = x.clone()
+        
+        for step in range(self.num_steps):
+            t = t + dt
+            dw = torch.randn_like(x) * math.sqrt(dt)
+            dx = self.drift_coefficient(x_t, t) * dt + \
+                 self.diffusion_coefficient(t).unsqueeze(-1) * dw
+            x_t = x_t + dx
+            
+        return x_t
+
+    def reverse_sde(self, x, condition, dt=1e-3):
+        batch_size = x.shape[0]
+        t = torch.ones(batch_size, device=x.device)
+        x_t = x.clone()
+        
+        total_score_loss = 0
+        
+        for step in range(self.num_steps):
+            
+            score = self.score_network(x_t, t, condition)
+            score_loss = self.score_matching_loss(x_t, condition, t)
+            total_score_loss += score_loss
+            
+            drift = self.drift_coefficient(x_t, t)
+            diffusion = self.diffusion_coefficient(t)
+            
+            dw = torch.randn_like(x) * math.sqrt(dt) if step < self.num_steps - 1 else 0
+            
+            dx = (drift - diffusion.unsqueeze(-1)**2 * score) * dt + \
+                 diffusion.unsqueeze(-1) * dw
+            
+            x_t = x_t + dx
+            t = t - dt
+            
+        
+        return x_t, total_score_loss / self.num_steps
+
+class ModAlignADE(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        
+        self.text_encoder = RobertaModel.from_pretrained('roberta-base')
+        self.text_encoder.gradient_checkpointing_enable()
+        self.text_proj = nn.Linear(768, config.hidden_dim)
+        
+        
+        self.visual_encoder = ViTFeatureExtractor.from_pretrained('google/vit-base-patch16-224')
+        self.visual_proj = nn.Linear(768, config.hidden_dim)
+        
+        
+        self.text_transformer = nn.ModuleList([
+            TransformerEncoderLayer(config) for _ in range(config.num_encoder_layers)
+        ])
+        self.visual_transformer = nn.ModuleList([
+            TransformerEncoderLayer(config) for _ in range(config.num_encoder_layers)
+        ])
+        
+        
+        self.alignment_module = FeatureAlignmentModule(config)
+        self.recovery_module = FeatureRecoveryModule(config)
+        self.diffusion = StochasticDiffusion(config)
+        
+        
+        self.fusion = nn.Sequential(
+            nn.Linear(config.hidden_dim * 3, config.hidden_dim),
+            nn.LayerNorm(config.hidden_dim),
+            nn.ReLU(),nn.Dropout(config.dropout),
+            nn.Linear(config.hidden_dim, config.num_classes)
         )
         
-        self.img_specific_classifier = nn.Linear(768, num_classes)
-        self.text_specific_classifier = nn.Linear(768, num_classes)
-        
-        self.missing_modality_generator = nn.Linear(512, 512)
+        self.config = config
 
-    def forward(self, image, input_ids, attention_mask, fine_tuned_input_ids, fine_tuned_attention_mask, image_mask, text_mask):
-        batch_size = image.size(0)
+    def encode_text(self, text_inputs):
+        outputs = self.text_encoder(**text_inputs)
+        hidden_states = outputs.last_hidden_state
+        x = self.text_proj(hidden_states)
         
-        # Process image
-        img_features = self.vit(pixel_values=image).last_hidden_state
-        img_features = img_features * image_mask.unsqueeze(1).unsqueeze(2)
-        
-        # Process original text
-        text_features = self.roberta(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
-        text_features = text_features * text_mask.unsqueeze(1).unsqueeze(2)
-        
-        # Process fine-tuned text
-        fine_tuned_features = self.roberta(input_ids=fine_tuned_input_ids, attention_mask=fine_tuned_attention_mask).last_hidden_state
-        
-        # Use fine-tuned text when image is available
-        text_features = torch.where(image_mask.unsqueeze(1).unsqueeze(2),
-                                    fine_tuned_features,
-                                    text_features)
+        for layer in self.text_transformer:
+            x = layer(x)
+        return x
 
-        fused_img, fused_text = self.cross_vit(img_features, text_features)
+    def encode_visual(self, image_inputs):
+        x = self.visual_encoder(image_inputs)
+        x = x.unsqueeze(1).expand(-1, 197, -1)
+        x = self.visual_proj(x)
         
-        img_cls = fused_img[:, 0]
-        text_cls = fused_text[:, 0]
-        
-        # Generate missing modality features
-        missing_img_features = self.missing_modality_generator(text_cls) * (~image_mask).unsqueeze(1)
-        missing_text_features = self.missing_modality_generator(img_cls) * (~text_mask).unsqueeze(1)
-        
-        # Combine with original features
-        img_cls = img_cls + missing_img_features
-        text_cls = text_cls + missing_text_features
-        
-        combined = torch.cat((img_cls, text_cls), dim=1)
-        shared_output = self.shared_classifier(combined)
-        
-        img_specific_output = self.img_specific_classifier(img_features[:, 0])
-        text_specific_output = self.text_specific_classifier(text_features[:, 0])
-        
-        return shared_output, img_specific_output, text_specific_output, img_cls, text_cls
+        for layer in self.visual_transformer:
+            x = layer(x)
+        return x
 
-class ADEDataset(Dataset):
-    def __init__(self, csv_file, img_dir, mask_prob=0.3):
-        self.data = pd.read_csv(csv_file)
-        self.img_dir = img_dir
-        self.image_processor = ViTFeatureExtractor.from_pretrained('google/vit-base-patch16-224')
-        self.tokenizer = RobertaTokenizer.from_pretrained('roberta-base')
-        self.mask_prob = mask_prob
+    def recover_features(self, x, condition, is_text=True):
+        x_cls = x[:, 0, :]
+        condition_cls = condition[:, 0, :]
+        
+        recovered_cls, score_loss = self.recovery_module.reverse_sde(
+            x=x_cls,
+            condition=condition_cls
+        )
+        
+        recovered = recovered_cls.unsqueeze(1).expand(-1, x.size(1), -1)
+        return recovered, score_loss
+
+    def forward(self, text_inputs, image_inputs, blip_inputs=None, modality_masks=None):
+        
+        text_features = self.encode_text(text_inputs)
+        visual_features = self.encode_visual(image_inputs)
+        
+        if blip_inputs is not None:
+            blip_features = self.encode_text(blip_inputs)
+        else:
+            blip_features = text_features.clone()
+        
+        # Feature alignment
+        v2t_aligned, t2t_aligned = self.alignment_module(text_features, visual_features, blip_features)
+        alignment_losses = self.alignment_module.compute_loss(v2t_aligned, t2t_aligned, text_features)
+        
+        # Initialize score matching loss
+        total_score_loss = 0
+        
+        # Handle missing modalities
+        if modality_masks is not None:
+            if modality_masks['text'].any():
+                text_features, text_score_loss = self.recover_features(text_features, visual_features, is_text=True)
+                total_score_loss += text_score_loss
+            if modality_masks['vision'].any():
+                visual_features, visual_score_loss = self.recover_features(visual_features, text_features, is_text=False)
+                total_score_loss += visual_score_loss
+        
+        # Feature fusion
+        text_cls = text_features[:, 0, :]
+        visual_cls = visual_features[:, 0, :]
+        blip_cls = blip_features[:, 0, :]
+        
+        fused_features = torch.cat([text_cls, visual_cls, blip_cls], dim=-1)
+        output = self.fusion(fused_features)
+        
+        return {
+            'output': output,
+            'v2t_loss': alignment_losses[0],
+            't2t_loss': alignment_losses[1],
+            'score_loss': total_score_loss,
+            'text_features': text_features,
+            'visual_features': visual_features,
+            'blip_features': blip_features
+        }
+
+class MultimodalDataset(Dataset):
+    def __init__(self, csv_path, image_dir, tokenizer, max_retries=3):
+        self.df = pd.read_csv(csv_path)
+        self.image_dir = image_dir
+        self.tokenizer = tokenizer
+        self.max_retries = max_retries
+        self.transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
 
     def __len__(self):
-        return len(self.data)
+        return len(self.df)
 
     def __getitem__(self, idx):
-        img_name = os.path.join(self.img_dir, self.data.iloc[idx, 0])
-        image = Image.open(img_name).convert('RGB')
+        row = self.df.iloc[idx]
         
-        text = self.data.iloc[idx, 1]
-        blip_fine_tuned_final = self.data.iloc[idx, -1]
-        label = 1 if self.data.iloc[idx, 2] == 'ADR' else 0
+        for retry in range(self.max_retries):
+            try:
+                text = str(row['Text'])
+                text_encoding = self.tokenizer(
+                    text,
+                    padding='max_length',
+                    max_length=512,
+                    truncation=True,
+                    return_tensors='pt'
+                )
+                
+                image_path = os.path.join(self.image_dir, row['Image'])
+                image = Image.open(image_path).convert('RGB')
+                image = self.transform(image)
+                
+                label = torch.tensor(row['label'], dtype=torch.float)
+                
+                return {
+                    'text': {k: v.squeeze(0) for k, v in text_encoding.items()},
+                    'image': image,
+                    'label': label
+                }
+            except Exception as e:
+                if retry == self.max_retries - 1:
+                    logger.error(f"Failed to load data at index {idx} after {self.max_retries} attempts: {str(e)}")
+                    raise
+                continue
 
-        # Process image
-        image = self.image_processor(images=image, return_tensors="pt")['pixel_values'].squeeze()
-
-        # Process text
-        encoding = self.tokenizer.encode_plus(
-            text,
-            add_special_tokens=True,
-            max_length=128,
-            padding='max_length',
-            truncation=True,
-            return_attention_mask=True,
-            return_tensors='pt'
+class Trainer:
+    def __init__(self, model, train_loader, val_loader, config):
+        self.model = model.to(config.device)
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.config = config
+        self.criterion = nn.BCEWithLogitsLoss()
+        self.optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=config.learning_rate,
+            weight_decay=config.weight_decay
         )
-        input_ids = encoding['input_ids'].squeeze()
-        attention_mask = encoding['attention_mask'].squeeze()
+        self.mask_prob = config.mask_prob
+        self.best_val_loss = float('inf')
 
-        # Process blip fine-tuned final text
-        blip_fine_tuned_encoding = self.tokenizer.encode_plus(
-            blip_fine_tuned_final,
-            add_special_tokens=True,
-            max_length=128,
-            padding='max_length',
-            truncation=True,
-            return_attention_mask=True,
-            return_tensors='pt'
-        )
-        blip_fine_tuned_input_ids = blip_fine_tuned_encoding['input_ids'].squeeze()
-        blip_fine_tuned_attention_mask = blip_fine_tuned_encoding['attention_mask'].squeeze()
-
-        # Randomly mask one modality
-        mask_image = random.random() < self.mask_prob
-        mask_text = random.random() < self.mask_prob
-        
-        if mask_image and mask_text:
-            mask_text = False  # Ensure at least one modality is always present
-
-        return {
-            'image': image if not mask_image else torch.zeros_like(image),
-            'input_ids': input_ids,
-            'attention_mask': attention_mask,
-            'fine_tuned_input_ids': blip_fine_tuned_input_ids,
-            'fine_tuned_attention_mask': blip_fine_tuned_attention_mask,
-            'image_mask': torch.tensor(not mask_image, dtype=torch.bool),
-            'text_mask': torch.tensor(not mask_text, dtype=torch.bool),
-            'label': torch.tensor(label, dtype=torch.long)
+    def _generate_random_masks(self, batch_size):
+        masks = {
+            'text': torch.zeros(batch_size, dtype=torch.bool, device=self.config.device),
+            'vision': torch.zeros(batch_size, dtype=torch.bool, device=self.config.device)
         }
-def collate_fn(batch):
-    return {
-        'image': torch.stack([item['image'] for item in batch]),
-        'input_ids': torch.stack([item['input_ids'] for item in batch]),
-        'attention_mask': torch.stack([item['attention_mask'] for item in batch]),
-        'fine_tuned_input_ids': torch.stack([item['fine_tuned_input_ids'] for item in batch]),
-        'fine_tuned_attention_mask': torch.stack([item['fine_tuned_attention_mask'] for item in batch]),
-        'image_mask': torch.stack([item['image_mask'] for item in batch]),
-        'text_mask': torch.stack([item['text_mask'] for item in batch]),
-        'label': torch.stack([item['label'] for item in batch])
-    }
+        for i in range(batch_size):
+            if torch.rand(1).item() < self.mask_prob:
+                if torch.rand(1).item() < 0.5:
+                    masks['text'][i] = True
+                else:
+                    masks['vision'][i] = True
+        return masks
 
-def train_epoch(model, dataloader, criterion, optimizer, device, lambda_align=0.1):
-    model.train()
-    total_loss = 0
-    
-    for batch in tqdm(dataloader, desc="Training"):
-        optimizer.zero_grad()
+    def train_epoch(self):
+        self.model.train()
+        total_loss = 0
+        all_preds = []
+        all_labels = []
         
-        batch = {k: v.to(device) for k, v in batch.items()}
-        
-        shared_output, img_specific_output, text_specific_output, img_cls, text_cls = model(
-            image=batch['image'],
-            input_ids=batch['input_ids'],
-            attention_mask=batch['attention_mask'],
-            fine_tuned_input_ids=batch['fine_tuned_input_ids'],
-            fine_tuned_attention_mask=batch['fine_tuned_attention_mask'],
-            image_mask=batch['image_mask'],
-            text_mask=batch['text_mask']
-        )
-        
-        shared_loss = criterion(shared_output, batch['label'])
-        img_specific_loss = criterion(img_specific_output, batch['label'])
-        text_specific_loss = criterion(text_specific_output, batch['label'])
-        
-        # Distribution alignment loss
-        align_loss = F.mse_loss(img_cls, text_cls)
-        
-        loss = shared_loss + 0.2 * img_specific_loss + 0.2 * text_specific_loss + lambda_align * align_loss
-        
-        loss.backward()
-        optimizer.step()
-        
-        total_loss += loss.item()
-    
-    return total_loss / len(dataloader)
-
-def evaluate(model, dataloader, criterion, device):
-    model.eval()
-    total_loss = 0
-    all_preds = []
-    all_labels = []
-    
-    with torch.no_grad():
-        for batch in tqdm(dataloader, desc="Evaluating"):
-            batch = {k: v.to(device) for k, v in batch.items()}
+        for batch in tqdm(self.train_loader, desc="Training"):
+            text_inputs = {k: v.to(self.config.device) for k, v in batch['text'].items()}
+            images = batch['image'].to(self.config.device)
+            labels = batch['label'].to(self.config.device)
             
-            shared_output, _, _, _, _ = model(
-                image=batch['image'],
-                input_ids=batch['input_ids'],
-                attention_mask=batch['attention_mask'],
-                fine_tuned_input_ids=batch['fine_tuned_input_ids'],
-                fine_tuned_attention_mask=batch['fine_tuned_attention_mask'],
-                image_mask=batch['image_mask'],
-                text_mask=batch['text_mask']
-            )
+            modality_masks = self._generate_random_masks(labels.size(0))
             
-            loss = criterion(shared_output, batch['label'])
+            outputs = self.model(text_inputs, images, modality_masks=modality_masks)
+            
+            task_loss = self.criterion(outputs['output'].squeeze(), labels)
+            alignment_loss = outputs['v2t_loss'] + outputs['t2t_loss']
+            score_loss = outputs['score_loss']
+            
+            # Combined loss with score matching
+            loss = task_loss + self.config.beta * alignment_loss + self.lambda_score * score_loss
+            
+            self.optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            self.optimizer.step()
+            
             total_loss += loss.item()
             
-            preds = torch.argmax(shared_output, dim=1)
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(batch['label'].cpu().numpy())
-    
-    accuracy = accuracy_score(all_labels, all_preds)
-    f1 = f1_score(all_labels, all_preds, average='weighted')
-    recall = recall_score(all_labels, all_preds, average='weighted')
-    precision = precision_score(all_labels, all_preds, average='weighted')
-    
-    return total_loss / len(dataloader), accuracy, f1, recall, precision
+            preds = torch.sigmoid(outputs['output']).detach().cpu().numpy()
+            all_preds.extend(preds.ravel())
+            all_labels.extend(labels.cpu().numpy().ravel())
+        
+        metrics = self.compute_metrics(all_preds, all_labels)
+        metrics['loss'] = total_loss / len(self.train_loader)
+        
+        return metrics
 
-def plot_training_history(train_losses, val_losses, val_accuracies, val_f1_scores):
-    epochs = range(1, len(train_losses) + 1)
+    def validate(self):
+        self.model.eval()
+        total_loss = 0
+        all_preds = []
+        all_labels = []
+        
+        with torch.no_grad():
+            for batch in tqdm(self.val_loader, desc="Validating"):
+                text_inputs = {k: v.to(self.config.device) for k, v in batch['text'].items()}
+                images = batch['image'].to(self.config.device)
+                labels = batch['label'].to(self.config.device)
+                
+                modality_masks = self._generate_random_masks(labels.size(0))
+                outputs = self.model(text_inputs, images, modality_masks=modality_masks)
+                
+                task_loss = self.criterion(outputs['output'].squeeze(), labels)
+                alignment_loss = outputs['v2t_loss'] + outputs['t2t_loss']
+                loss = task_loss + self.config.beta * alignment_loss
+                
+                total_loss += loss.item()
+                
+                preds = torch.sigmoid(outputs['output']).detach().cpu().numpy()
+                all_preds.extend(preds.ravel())
+                all_labels.extend(labels.cpu().numpy().ravel())
+        
+        metrics = self.compute_metrics(all_preds, all_labels)
+        metrics['loss'] = total_loss / len(self.val_loader)
+        
+        return metrics
 
-    plt.figure(figsize=(15, 5))
-    
-    plt.subplot(1, 3, 1)
-    plt.plot(epochs, train_losses, 'b-', label='Training Loss')
-    plt.plot(epochs, val_losses, 'r-', label='Validation Loss')
-    plt.title('Training and Validation Loss')
-    plt.xlabel('Epochs')
-    plt.ylabel('Loss')
-    plt.legend()
+    @staticmethod
+    def compute_metrics(preds, labels):
+        preds = (np.array(preds) > 0.5).astype(np.int64)
+        labels = np.array(labels).astype(np.int64)
+        return {
+            'accuracy': accuracy_score(labels, preds),
+            'precision': precision_score(labels, preds),
+            'recall': recall_score(labels, preds),
+            'f1': f1_score(labels, preds)
+        }
 
-    plt.subplot(1, 3, 2)
-    plt.plot(epochs, val_accuracies, 'g-')
-    plt.title('Validation Accuracy')
-    plt.xlabel('Epochs')
-    plt.ylabel('Accuracy')
-
-    plt.subplot(1, 3, 3)
-    plt.plot(epochs, val_f1_scores, 'm-')
-    plt.title('Validation F1 Score')
-    plt.xlabel('Epochs')
-    plt.ylabel('F1 Score')
-
-    plt.tight_layout()
-    plt.savefig('missing_modality_proposed_final_training_history.png')
-    plt.close()
-
-def plot_confusion_matrix(y_true, y_pred):
-    cm = confusion_matrix(y_true, y_pred)
-    plt.figure(figsize=(10, 8))
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
-    plt.title('Confusion Matrix')
-    plt.ylabel('True Label')
-    plt.xlabel('Predicted Label')
-    plt.savefig('missing_modality_proposed_final_confusion_matrix.png')
-    plt.close()
+    def save_checkpoint(self, epoch, metrics):
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'metrics': metrics,
+            'config': self.config
+        }
+        path = os.path.join(self.config.checkpoint_dir, f'checkpoint_epoch_{epoch}.pth')
+        torch.save(checkpoint, path)
+        
+        if metrics['loss'] < self.best_val_loss:
+            self.best_val_loss = metrics['loss']
+            best_path = os.path.join(self.config.checkpoint_dir, 'best_model.pth')
+            torch.save(checkpoint, best_path)
+            logger.info(f"Saved new best model with validation loss: {metrics['loss']:.4f}")
 
 def main():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    torch.manual_seed(42)
+    np.random.seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(42)
 
-    dataset = ADEDataset(csv_file='blip_fine_tuned_with_captions.csv', img_dir='combined_adr_images', mask_prob=0.3)
-    
-    train_data, test_data = train_test_split(dataset, test_size=0.2, random_state=42)
-    train_data, val_data = train_test_split(train_data, test_size=0.2, random_state=42)
+    config = Config()
+    config._validate_config()
 
-    train_loader = DataLoader(train_data, batch_size=32, shuffle=True, collate_fn=collate_fn)
-    val_loader = DataLoader(val_data, batch_size=32, collate_fn=collate_fn)
-    test_loader = DataLoader(test_data, batch_size=32, collate_fn=collate_fn)
+    os.makedirs(config.checkpoint_dir, exist_ok=True)
+    os.makedirs(config.log_dir, exist_ok=True)
 
-    model = ADEClassifier(num_classes=2).to(device)
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(os.path.join(config.log_dir, 'training.log')),
+            logging.StreamHandler()
+        ]
+    )
 
-    labels = [data['label'].item() for data in train_data]
-    class_weights = compute_class_weight('balanced', classes=np.unique(labels), y=labels)
-    class_weights = torch.tensor(class_weights, dtype=torch.float).to(device)
+    logger.info(f"Using device: {config.device}")
+    logger.info(f"Using masking probability: {config.mask_prob}")
 
-    criterion = nn.CrossEntropyLoss(weight=class_weights)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-5, weight_decay=0.01)
-    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2)
+    tokenizer = RobertaTokenizer.from_pretrained('roberta-base')
 
-    num_epochs = 50
-    best_val_accuracy = 0
-    train_losses, val_losses, val_accuracies, val_f1_scores = [], [], [], []
+    try:
+        dataset = MultimodalDataset(
+            csv_path=config.data_path,
+            image_dir=config.image_dir,
+            tokenizer=tokenizer
+        )
 
-    for epoch in range(num_epochs):
-        train_loss = train_epoch(model, train_loader, criterion, optimizer, device)
-        val_loss, val_accuracy, val_f1, val_recall, val_precision = evaluate(model, val_loader, criterion, device)
-        
-        scheduler.step()
-        
-        train_losses.append(train_loss)
-        val_losses.append(val_loss)
-        val_accuracies.append(val_accuracy)
-        val_f1_scores.append(val_f1)
-        
-        print(f"Epoch {epoch+1}/{num_epochs}")
-        print(f"Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
-        print(f"Val Accuracy: {val_accuracy:.4f}, Val F1: {val_f1:.4f}")
-        print(f"Val Recall: {val_recall:.4f}, Val Precision: {val_precision:.4f}")
-        
-        if val_accuracy > best_val_accuracy:
-            best_val_accuracy = val_accuracy
-            torch.save(model.state_dict(), 'best_model.pth')
-        
-        print()
+        train_size = int(0.8 * len(dataset))
+        val_size = len(dataset) - train_size
+        train_dataset, val_dataset = random_split(
+            dataset,
+            [train_size, val_size],
+            generator=torch.Generator().manual_seed(42)
+        )
 
-    # Plot training history
-    plot_training_history(train_losses, val_losses, val_accuracies, val_f1_scores)
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=config.batch_size,
+            shuffle=True,
+            num_workers=config.num_workers,
+            pin_memory=True
+        )
 
-    # Load best model and evaluate on test set
-    model.load_state_dict(torch.load('best_model.pth'))
-    test_loss, test_accuracy, test_f1, test_recall, test_precision = evaluate(model, test_loader, criterion, device)
-    print(f"Test Loss: {test_loss:.4f}, Test Accuracy: {test_accuracy:.4f}, Test F1: {test_f1:.4f}")
-    print(f"Test Recall: {test_recall:.4f}, Test Precision: {test_precision:.4f}")
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=config.batch_size,
+            shuffle=False,
+            num_workers=config.num_workers,
+            pin_memory=True
+        )
 
-    # Generate predictions for confusion matrix
-    model.eval()
-    all_preds = []
-    all_labels = []
-    with torch.no_grad():
-        for batch in test_loader:
-            batch = {k: v.to(device) for k, v in batch.items()}
+        logger.info(f"Train size: {len(train_dataset)}, Val size: {len(val_dataset)}")
+
+        model = ModAlignADE(config)
+        trainer = Trainer(model, train_loader, val_loader, config)
+
+        best_val_loss = float('inf')
+        train_start_time = datetime.now()
+
+        for epoch in range(config.num_epochs):
+            epoch_start = datetime.now()
             
-            shared_output, _, _, _, _ = model(
-                image=batch['image'],
-                input_ids=batch['input_ids'],
-                attention_mask=batch['attention_mask'],
-                fine_tuned_input_ids=batch['fine_tuned_input_ids'],
-                fine_tuned_attention_mask=batch['fine_tuned_attention_mask'],
-                image_mask=batch['image_mask'],
-                text_mask=batch['text_mask']
-            )
-            preds = torch.argmax(shared_output, dim=1)
+            train_metrics = trainer.train_epoch()
+            val_metrics = trainer.validate()
             
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(batch['label'].cpu().numpy())
+            trainer.save_checkpoint(epoch, val_metrics)
+            
+            epoch_time = datetime.now() - epoch_start
 
-    # Plot confusion matrix
-    plot_confusion_matrix(all_labels, all_preds)
+            logger.info(f"\nEpoch {epoch+1}/{config.num_epochs}")
+            logger.info(f"Time: {epoch_time}")
+            logger.info("Train Metrics:")
+            for k, v in train_metrics.items():
+                logger.info(f"  {k}: {v:.4f}")
+            logger.info("Validation Metrics:")
+            for k, v in val_metrics.items():
+                logger.info(f"  {k}: {v:.4f}")
 
-    print("Training completed. Plots have been saved.")
+            logger.info("-" * 50)
+
+        training_time = datetime.now() - train_start_time
+        results = {
+            'final_val_metrics': val_metrics,
+            'training_time': str(training_time),
+            'total_epochs': config.num_epochs,
+            'best_val_loss': best_val_loss
+        }
+
+        with open(os.path.join(config.log_dir, 'final_results.json'), 'w') as f:
+            json.dump(results, f, indent=4)
+
+        logger.info(f"\nTraining completed! Total time: {training_time}")
+
+    except Exception as e:
+        logger.error(f"Training failed with error: {str(e)}")
+        raise e
+
+    finally:
+        logger.info("Cleaning up...")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 if __name__ == "__main__":
     main()
